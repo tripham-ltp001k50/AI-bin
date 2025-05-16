@@ -1,0 +1,311 @@
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+
+# Đường dẫn dữ liệu
+data_dir = '/content/drive/MyDrive/AI successfully'
+
+# ================== CẤU HÌNH THAM SỐ ==================
+IMG_SIZE = 224  # Kích thước ảnh đầu vào
+BATCH_SIZE = 32  # Kích thước batch
+EPOCHS_INITIAL = 15  # Số epochs cho giai đoạn đầu
+EPOCHS_FINETUNE = 35  # Số epochs cho giai đoạn fine-tune
+LEARNING_RATE_INITIAL = 1e-4  # Learning rate ban đầu
+LEARNING_RATE_FINETUNE = 5e-5  # Learning rate cho fine-tune
+# ======================================================
+
+# ================== DATA AUGMENTATION ==================
+# Data augmentation mạnh mẽ hơn cho training
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,  # 20% làm validation
+    rotation_range=40,     # Xoay ảnh nhiều hơn
+    width_shift_range=0.25,
+    height_shift_range=0.25,
+    shear_range=0.2,       # Thêm biến dạng góc
+    zoom_range=0.3,        # Zoom in/out nhiều hơn
+    horizontal_flip=True,
+    vertical_flip=True,    # Thêm lật dọc
+    brightness_range=[0.8, 1.2],  # Thay đổi độ sáng
+    channel_shift_range=0.2,      # Thay đổi các kênh màu
+    fill_mode='nearest'
+)
+
+# Chỉ rescale cho validation
+val_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2
+)
+
+# Tạo generators
+print("🔄 Đang tạo generators cho dữ liệu...")
+train_generator = train_datagen.flow_from_directory(
+    data_dir,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='training',
+    shuffle=True
+)
+
+validation_generator = val_datagen.flow_from_directory(
+    data_dir,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='validation',
+    shuffle=False
+)
+
+# In ra các classes và số lượng ảnh
+class_indices = train_generator.class_indices
+class_names = list(class_indices.keys())
+print(f"🏷️ Các lớp nhận dạng: {class_names}")
+
+# ================== TÍNH CLASS WEIGHTS ==================
+# Tính class weights để xử lý mất cân bằng dữ liệu
+class_counts = [0] * len(class_names)
+for subdir in os.listdir(data_dir):
+    subdir_path = os.path.join(data_dir, subdir)
+    if os.path.isdir(subdir_path) and subdir in class_indices:
+        class_counts[class_indices[subdir]] = len([f for f in os.listdir(subdir_path)
+                                                if os.path.isfile(os.path.join(subdir_path, f))])
+
+print(f"📊 Số lượng ảnh mỗi lớp: {dict(zip(class_names, class_counts))}")
+
+# Tính class weights tự động
+total_samples = sum(class_counts)
+class_weights = {i: total_samples / (len(class_counts) * count) if count > 0 else 1.0
+                for i, count in enumerate(class_counts)}
+print(f"⚖️ Class weights: {class_weights}")
+
+# ================== ĐỊNH NGHĨA MÔ HÌNH ==================
+def create_model(trainable=False, lr=LEARNING_RATE_INITIAL):
+    """Tạo và compile mô hình MobileNetV2 với các cài đặt tùy chỉnh"""
+
+    # Load MobileNetV2 pre-trained
+    base_model = MobileNetV2(
+        input_shape=(IMG_SIZE, IMG_SIZE, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+
+    # Đặt trạng thái trainable cho base model
+    base_model.trainable = trainable
+
+    # Nếu fine-tuning, chỉ train các lớp cuối
+    if trainable:
+        # Đóng băng các layer đầu, mở khóa các layer cuối
+        fine_tune_at = len(base_model.layers) - 30  # Mở khóa ~30 lớp cuối
+        for layer in base_model.layers[:fine_tune_at]:
+            layer.trainable = False
+
+        print(f"🔓 Đã mở khóa {len(base_model.layers) - fine_tune_at} lớp cuối của MobileNetV2 để fine-tune")
+
+    # Xây dựng model head phức tạp hơn
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+
+    # Thêm các lớp fully connected với batch normalization và dropout
+    x = Dense(512, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+
+    x = Dense(128, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+
+    # Lớp output với softmax
+    predictions = Dense(len(class_names), activation='softmax')(x)
+
+    # Tạo model
+    model = Model(inputs=base_model.input, outputs=predictions)
+
+    # Compile với optimizer Adam
+    model.compile(
+        optimizer=Adam(learning_rate=lr),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+# ================== CALLBACKS ==================
+# Tạo các callbacks
+checkpoint_path = '/content/drive/MyDrive/waste_classifier_best.h5'
+callbacks = [
+    # Lưu model tốt nhất
+    ModelCheckpoint(
+        checkpoint_path,
+        monitor='val_accuracy',
+        save_best_only=True,
+        mode='max',
+        verbose=1
+    ),
+    # Dừng sớm nếu không cải thiện
+    EarlyStopping(
+        monitor='val_accuracy',
+        patience=8,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    # Giảm learning rate khi plateau
+    ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.2,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    )
+]
+
+# ================== TRAINING - PHASE 1 ==================
+print("\n" + "="*50)
+print("PHASE 1: TRAINING ONLY TOP LAYERS")
+print("="*50)
+
+# Tạo model với base layers đóng băng
+model = create_model(trainable=False, lr=LEARNING_RATE_INITIAL)
+print("📊 Tổng quan mô hình:")
+model.summary()
+
+# Training phase 1
+print("\n🚀 Bắt đầu training phase 1...")
+history_initial = model.fit(
+    train_generator,
+    epochs=EPOCHS_INITIAL,
+    validation_data=validation_generator,
+    callbacks=callbacks,
+    class_weight=class_weights,
+    verbose=1
+)
+
+# ================== TRAINING - PHASE 2 (FINE-TUNING) ==================
+print("\n" + "="*50)
+print("PHASE 2: FINE-TUNING THE MODEL")
+print("="*50)
+
+# Tạo model phase 2 với fine-tuning layers cuối
+model = create_model(trainable=True, lr=LEARNING_RATE_FINETUNE)
+
+# Training phase 2 (fine-tuning)
+print("\n🚀 Bắt đầu fine-tuning...")
+history_finetune = model.fit(
+    train_generator,
+    epochs=EPOCHS_FINETUNE,
+    validation_data=validation_generator,
+    callbacks=callbacks,
+    class_weight=class_weights,
+    initial_epoch=len(history_initial.history['accuracy']),  # Tiếp tục từ epoch cuối của phase 1
+    verbose=1
+)
+
+# Gộp lịch sử training
+history = {
+    'accuracy': history_initial.history['accuracy'] + history_finetune.history['accuracy'],
+    'val_accuracy': history_initial.history['val_accuracy'] + history_finetune.history['val_accuracy'],
+    'loss': history_initial.history['loss'] + history_finetune.history['loss'],
+    'val_loss': history_initial.history['val_loss'] + history_finetune.history['val_loss']
+}
+
+# ================== ĐÁNH GIÁ MÔ HÌNH ==================
+# Load model tốt nhất
+model.load_weights(checkpoint_path)
+
+# Đánh giá trên tập validation
+print("\n" + "="*50)
+print("EVALUATING MODEL")
+print("="*50)
+
+# Dự đoán
+validation_generator.reset()
+Y_pred = model.predict(validation_generator, verbose=1)
+y_pred = np.argmax(Y_pred, axis=1)
+y_true = validation_generator.classes
+
+# Vẽ confusion matrix
+print("\n🔍 Đang vẽ confusion matrix...")
+cm = confusion_matrix(y_true, y_pred)
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Dự đoán')
+plt.ylabel('Thực tế')
+plt.title('Confusion Matrix')
+plt.savefig('/content/drive/MyDrive/confusion_matrix.png')
+plt.show()
+
+# In classification report
+print("\n📊 Classification Report:")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# Vẽ learning curves
+print("\n📈 Đang vẽ learning curves...")
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history['accuracy'], label='Training Accuracy')
+plt.plot(history['val_accuracy'], label='Validation Accuracy')
+plt.axvline(x=EPOCHS_INITIAL, color='r', linestyle='--', label='Start Fine-tuning')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history['loss'], label='Training Loss')
+plt.plot(history['val_loss'], label='Validation Loss')
+plt.axvline(x=EPOCHS_INITIAL, color='r', linestyle='--', label='Start Fine-tuning')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/learning_curves.png')
+plt.show()
+
+# ================== LƯU MÔ HÌNH CUỐI CÙNG ==================
+model_save_path = '/content/drive/MyDrive/waste_3classes_mobilenetv2_improved.h5'
+model.save(model_save_path)
+print(f"\n✅ Đã lưu mô hình MobileNetV2 cải tiến tại: {model_save_path}")
+
+# ================== PHÂN TÍCH LỖI ==================
+# Tìm các trường hợp dự đoán sai
+print("\n🔍 Phân tích một số trường hợp dự đoán sai...")
+
+errors = np.where(y_pred != y_true)[0]
+if len(errors) > 0:
+    print(f"Số lượng dự đoán sai: {len(errors)}/{len(y_true)} ({len(errors)/len(y_true)*100:.2f}%)")
+
+    # Chọn ngẫu nhiên tối đa 5 trường hợp lỗi để hiển thị
+    import random
+    sample_errors = random.sample(list(errors), min(5, len(errors)))
+
+    # Lấy tên file và label thực tế/dự đoán
+    filenames = [validation_generator.filenames[i] for i in sample_errors]
+    true_labels = [class_names[y_true[i]] for i in sample_errors]
+    pred_labels = [class_names[y_pred[i]] for i in sample_errors]
+
+    for i, (filename, true_label, pred_label) in enumerate(zip(filenames, true_labels, pred_labels)):
+        print(f"Lỗi #{i+1}: File '{filename}' - Thực tế: {true_label}, Dự đoán: {pred_label}")
+else:
+    print("Không có lỗi dự đoán trên tập validation!")
+
+print("\n" + "="*50)
+print("🎉 TRAINING HOÀN THÀNH!")
+print("="*50)
+print(f"🎯 Accuracy train cuối cùng: {history['accuracy'][-1]*100:.2f}%")
+print(f"🎯 Accuracy validation cuối cùng: {history['val_accuracy'][-1]*100:.2f}%")
+print(f"📝 Kết quả chi tiết đã được lưu thành confusion_matrix.png và learning_curves.png")
+print(f"💾 Mô hình tốt nhất được lưu tại {checkpoint_path}")
+print(f"💾 Mô hình cuối cùng được lưu tại {model_save_path}")
