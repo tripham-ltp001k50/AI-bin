@@ -1,0 +1,211 @@
+import cv2
+import numpy as np
+from tensorflow.keras.models import load_model
+import time
+from PIL import Image, ImageDraw, ImageFont
+from gtts import gTTS
+import playsound
+import os
+import serial  # Thư viện kết nối Arduino
+from datetime import datetime
+
+# Tắt cảnh báo oneDNN
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Kết nối Arduino
+try:
+    arduino = serial.Serial('COM4', 9600, timeout=2)
+    time.sleep(2)
+    print("✅ Đã kết nối Arduino thành công!")
+except Exception as e:
+    print(f"❌ Không thể kết nối Arduino: {e}")
+    arduino = None
+
+# Load mô hình
+try:
+    model = load_model('waste_classifier_best.h5')
+    print("✅ Đã load mô hình thành công!")
+except Exception as e:
+    print(f"❌ Lỗi khi load mô hình: {e}")
+    exit()
+
+# Danh sách lớp
+classes = ['Rác tái chế', 'Rác thải còn lại', 'Thực phẩm thừa']
+
+# Hàm đọc URL camera từ file config.txt
+def get_camera_url():
+    try:
+        with open("config.txt", "r") as f:
+            url = f.read().strip()
+            print(f"📡 Đã đọc URL camera từ config.txt: {url}")
+            return url
+    except Exception as e:
+        print(f"⚠️ Không đọc được config.txt, dùng webcam mặc định. Lỗi: {e}")
+        return '0'  # webcam mặc định
+
+# Tiền xử lý ảnh
+def preprocess_frame(frame):
+    try:
+        img = cv2.convertScaleAbs(frame, alpha=1.2, beta=30)
+        img = cv2.GaussianBlur(img, (5, 5), 0)
+        img = cv2.resize(img, (224, 224))
+        img = img.astype('float32') / 255.0
+        return np.expand_dims(img, axis=0)
+    except Exception as e:
+        print(f"Lỗi tiền xử lý: {e}")
+        return None
+
+# Hàm phát âm thanh
+def speak_result(text):
+    try:
+        filename = f"audio_{datetime.now().strftime('%H%M%S')}.mp3"
+        tts = gTTS(text=text, lang='vi')
+        tts.save(filename)
+        playsound.playsound(filename)
+        os.remove(filename)
+    except Exception as e:
+        print(f"❌ Lỗi phát âm: {e}")
+
+# Hàm vẽ kết quả
+def create_result_window(text):
+    img = np.ones((300, 500, 3), dtype=np.uint8) * 255
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", 30)
+    except:
+        font = ImageFont.load_default()
+    draw.text((10, 120), text, font=font, fill=(0, 0, 0))
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+# Hàm hiển thị giao diện đợi Enter
+def show_waiting_screen():
+    wait_img = np.ones((300, 500, 3), dtype=np.uint8) * 255
+    img_pil = Image.fromarray(cv2.cvtColor(wait_img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", 24)
+    except:
+        font = ImageFont.load_default()
+    draw.text((50, 100), "Nhấn ENTER để bắt đầu quét", font=font, fill=(0, 0, 0))
+    draw.text((50, 150), "Nhấn Q để thoát", font=font, fill=(0, 0, 0))
+    wait_screen = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    cv2.imshow("Nhận diện rác", wait_screen)
+
+# Hàm quét và nhận diện
+def scan_and_detect():
+    camera_url = get_camera_url()
+    cap = cv2.VideoCapture(camera_url)
+    
+    if not cap.isOpened():
+        print("⚠️ Không kết nối được camera IP, chuyển sang webcam mặc định...")
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("❌ Không mở được camera nào cả.")
+            return False
+
+    confidence_threshold = 0.5
+    max_duration = 5
+    start_time = time.time()
+    best_prediction = "Không thể xác định"
+    best_confidence = 0.0
+
+    while (time.time() - start_time) < max_duration:
+        ret, frame = cap.read()
+        if not ret:
+            print("Không đọc được frame.")
+            continue
+
+        processed = preprocess_frame(frame)
+        if processed is None:
+            continue
+
+        try:
+            predictions = model.predict(processed, verbose=0)
+            class_index = np.argmax(predictions[0])
+            confidence = np.max(predictions[0])
+            label = classes[class_index]
+            print(f"Dự đoán: {label} - {confidence:.2f}")
+
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_prediction = label
+
+            remaining = max_duration - (time.time() - start_time)
+            cv2.putText(frame, f"CHECK ({remaining:.1f}s)", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("Camera", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                cap.release()
+                cv2.destroyAllWindows()
+                return False
+
+        except Exception as e:
+            print(f"Lỗi dự đoán: {e}")
+
+    cap.release()
+    cv2.destroyWindow("Camera")
+
+    if best_confidence >= confidence_threshold:
+        result_label = f"KET QUA: {best_prediction} ({best_confidence*100:.1f}%)"
+    else:
+        result_label = "Không thể xác định vật thể"
+
+    print(result_label)
+
+    try:
+        cv2.imshow("Kết quả", create_result_window(result_label))
+        cv2.waitKey(1000)
+    except Exception as e:
+        print("⚠️ Lỗi hiển thị kết quả:", e)
+
+    speak_result(best_prediction)
+
+    if arduino:
+        try:
+            if "Rác tái chế" in best_prediction:
+                arduino.write(b'1')
+                print("📤 Gửi mở thùng rác 1")
+            elif "Rác thải còn lại" in best_prediction:
+                arduino.write(b'2')
+                print("📤 Gửi mở thùng rác 2")
+            elif "Thực phẩm thừa" in best_prediction:
+                arduino.write(b'3')
+                print("📤 Gửi mở thùng rác 3")
+            else:
+                print("📤 Không gửi tín hiệu vì không xác định vật thể.")
+        except Exception as e:
+            print(f"❌ Lỗi gửi dữ liệu Arduino: {e}")
+
+    time.sleep(7)
+    speak_result("Cảm ơn đã cho tôi rác")
+    cv2.destroyWindow("Kết quả")
+
+    return True
+
+# Vòng lặp chính
+def main():
+    print("Hệ thống nhận diện rác đã sẵn sàng!")
+    running = True
+
+    while running:
+        show_waiting_screen()
+        key = cv2.waitKey(0)
+
+        if key == 13:
+            cv2.destroyWindow("Nhận diện rác")
+            if scan_and_detect():
+                print("Đang chờ 5 giây trước khi sẵn sàng cho lần quét tiếp theo...")
+                time.sleep(5)
+            else:
+                running = False
+        elif key == ord('q'):
+            running = False
+
+    cv2.destroyAllWindows()
+    print("Đã thoát chương trình!")
+
+# Chạy
+if __name__ == "__main__":
+    main()
